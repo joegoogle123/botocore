@@ -154,7 +154,6 @@ class TestURLLib3Session(unittest.TestCase):
         call_kwargs = {
             'maxsize': mock.ANY,
             'timeout': mock.ANY,
-            'ssl_context': mock.ANY,
             'socket_options': [],
             'cert_file': None,
             'key_file': None,
@@ -349,7 +348,7 @@ class TestURLLib3Session(unittest.TestCase):
             self.request.url = 'https://example.com/'
             session.send(self.request.prepare())
             last_call = self.proxy_manager_fun.call_args[-1]
-            self.assertIs(last_call['ssl_context'].check_hostname, True)
+            self.assertIs(last_call['proxy_ssl_context'].check_hostname, True)
 
     def test_proxy_ssl_context_does_not_use_check_hostname_if_ip_address(self):
         cert = ('/some/cert', '/some/key')
@@ -374,7 +373,9 @@ class TestURLLib3Session(unittest.TestCase):
                 self.request.url = 'https://example.com/'
                 session.send(self.request.prepare())
                 last_call = self.proxy_manager_fun.call_args[-1]
-                self.assertIs(last_call['ssl_context'].check_hostname, False)
+                self.assertIs(
+                    last_call['proxy_ssl_context'].check_hostname, False
+                )
 
     def test_basic_request(self):
         session = URLLib3Session()
@@ -457,18 +458,18 @@ class TestURLLib3Session(unittest.TestCase):
         self.assert_proxy_manager_call(proxies['http'], proxy_headers={})
         self.assert_request_sent(url=self.request.url)
 
-    def test_ssl_context_is_explicit(self):
+    def test_ssl_context_is_created_per_connection(self):
         session = URLLib3Session()
         session.send(self.request.prepare())
         _, manager_kwargs = self.pool_manager_cls.call_args
-        self.assertIsNotNone(manager_kwargs.get('ssl_context'))
+        self.assertNotIn('ssl_context', manager_kwargs)
 
-    def test_proxy_request_ssl_context_is_explicit(self):
+    def test_proxy_request_ssl_context_is_created_per_connection(self):
         proxies = {'http': 'http://proxy.com'}
         session = URLLib3Session(proxies=proxies)
         session.send(self.request.prepare())
         _, proxy_kwargs = self.proxy_manager_fun.call_args
-        self.assertIsNotNone(proxy_kwargs.get('ssl_context'))
+        self.assertNotIn('ssl_context', proxy_kwargs)
 
     def test_session_forwards_socket_options_to_pool_manager(self):
         socket_options = [(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)]
@@ -526,7 +527,9 @@ class TestURLLib3Session(unittest.TestCase):
         http_class = self.pool_manager.pool_classes_by_scheme.get('http')
         self.assertIs(http_class, AWSHTTPConnectionPool)
         https_class = self.pool_manager.pool_classes_by_scheme.get('https')
-        self.assertIs(https_class, AWSHTTPSConnectionPool)
+        self.assertIsInstance(
+            https_class("example.com"), AWSHTTPSConnectionPool
+        )
 
     def test_chunked_encoding_is_set_with_header(self):
         session = URLLib3Session()
@@ -563,3 +566,77 @@ class TestURLLib3Session(unittest.TestCase):
             self.proxy_manager_fun.return_value.clear.call_count,
             1 + len(proxies),
         )
+
+
+@pytest.mark.parametrize(
+    'proxy_url',
+    [None, 'http://proxy.example:8080', 'https://proxy.example:8443'],
+)
+def test_concurrent_connections_do_not_mutate_the_same_context(proxy_url):
+    import ssl
+    import threading
+    from concurrent.futures import ThreadPoolExecutor
+
+    from urllib3.util.ssl_ import ssl_wrap_socket
+
+    # Force the two loads to overlap, without racing inside OpenSSL itself.
+    # On the old pool-wide context both calls observe two concurrent writers.
+    rendezvous = threading.Barrier(2)
+
+    class CheckedContext(ssl.SSLContext):
+        def __init__(self, protocol):
+            self.writers = 0
+            self.lock = threading.Lock()
+
+        def load_verify_locations(self, *args, **kwargs):
+            with self.lock:
+                self.writers += 1
+            rendezvous.wait(timeout=5)
+            with self.lock:
+                writers = self.writers
+            assert writers == 1, 'concurrent mutation of shared SSLContext'
+            # Retain the count until both callers have checked it.
+            rendezvous.wait(timeout=5)
+            super().load_verify_locations(*args, **kwargs)
+
+        def wrap_socket(self, *args, **kwargs):
+            return mock.sentinel.wrapped_socket
+
+    proxies = {'https': proxy_url} if proxy_url else None
+    with mock.patch('botocore.httpsession.SSLContext', CheckedContext):
+        session = URLLib3Session(proxies=proxies)
+        manager = session._get_connection_manager(
+            'https://s3.example', proxy_url
+        )
+        pool = manager.connection_from_url('https://s3.example')
+        session._setup_ssl_cert(pool, 'https://s3.example', True)
+        connections = [pool._new_conn(), pool._new_conn()]
+
+    def configure(connection):
+        return ssl_wrap_socket(
+            mock.sentinel.socket,
+            ssl_context=connection.ssl_context,
+            ca_certs=get_cert_path(True),
+            server_hostname='s3.example',
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        list(executor.map(configure, connections))
+
+
+def test_https_proxy_context_is_private_to_each_connection():
+    from botocore.httpsession import DEFAULT_CA_BUNDLE
+
+    session = URLLib3Session(
+        proxies={'https': 'https://proxy.example:8443'},
+        proxies_config={'proxy_ca_bundle': DEFAULT_CA_BUNDLE},
+    )
+    manager = session._get_proxy_manager('https://proxy.example:8443')
+    pool = manager.connection_from_url('https://s3.example')
+    first, second = pool._new_conn(), pool._new_conn()
+    assert first.ssl_context is not second.ssl_context
+    assert (
+        first.proxy_config.ssl_context is not second.proxy_config.ssl_context
+    )
+    assert first.proxy_config.ssl_context.cert_store_stats()['x509_ca'] > 0
+    assert first.proxy_config.ssl_context.check_hostname is True

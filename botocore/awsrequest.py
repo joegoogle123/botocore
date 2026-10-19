@@ -247,6 +247,33 @@ class AWSHTTPConnectionPool(HTTPConnectionPool):
 class AWSHTTPSConnectionPool(HTTPSConnectionPool):
     ConnectionCls = AWSHTTPSConnection
 
+    def __init__(
+        self,
+        *args,
+        ssl_context_factory=None,
+        proxy_ssl_context_factory=None,
+        **kwargs,
+    ):
+        self._ssl_context_factory = ssl_context_factory
+        self._proxy_ssl_context_factory = proxy_ssl_context_factory
+        super().__init__(*args, **kwargs)
+
+    def _new_conn(self):
+        conn = super()._new_conn()
+        # urllib3 configures contexts when connecting, including loading CA
+        # certificates. OpenSSL does not support concurrent context mutation.
+        # Keep both destination and HTTPS proxy contexts private to a connection.
+        if self._ssl_context_factory is not None:
+            conn.ssl_context = self._ssl_context_factory()
+        if (
+            self._proxy_ssl_context_factory is not None
+            and getattr(conn, "proxy_config", None) is not None
+        ):
+            conn.proxy_config = conn.proxy_config._replace(
+                ssl_context=self._proxy_ssl_context_factory()
+            )
+        return conn
+
 
 def prepare_request_dict(
     request_dict, endpoint_url, context=None, user_agent=None
