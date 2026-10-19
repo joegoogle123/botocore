@@ -6,6 +6,7 @@ import sys
 import warnings
 from base64 import b64encode
 from concurrent.futures import CancelledError
+from functools import partial
 
 from urllib3 import PoolManager, Timeout, proxy_from_url
 from urllib3.exceptions import (
@@ -311,7 +312,10 @@ class URLLib3Session:
         )
         self._pool_classes_by_scheme = {
             'http': botocore.awsrequest.AWSHTTPConnectionPool,
-            'https': botocore.awsrequest.AWSHTTPSConnectionPool,
+            'https': partial(
+                botocore.awsrequest.AWSHTTPSConnectionPool,
+                ssl_context_factory=self._get_ssl_context,
+            ),
         }
         if timeout is None:
             timeout = DEFAULT_TIMEOUT
@@ -348,7 +352,6 @@ class URLLib3Session:
         pool_manager_kwargs = {
             'timeout': self._timeout,
             'maxsize': self._max_pool_connections,
-            'ssl_context': self._get_ssl_context(),
             'socket_options': self._socket_options,
             'cert_file': self._cert_file,
             'key_file': self._key_file,
@@ -372,7 +375,16 @@ class URLLib3Session:
                 self._proxies_kwargs(proxy_ssl_context=proxy_ssl_context)
             )
             proxy_manager = proxy_from_url(proxy_url, **proxy_manager_kwargs)
-            proxy_manager.pool_classes_by_scheme = self._pool_classes_by_scheme
+            proxy_manager.pool_classes_by_scheme = {
+                **self._pool_classes_by_scheme,
+                'https': partial(
+                    botocore.awsrequest.AWSHTTPSConnectionPool,
+                    ssl_context_factory=self._get_ssl_context,
+                    proxy_ssl_context_factory=partial(
+                        self._setup_proxy_ssl_context, proxy_url
+                    ),
+                ),
+            }
             self._proxy_managers[proxy_url] = proxy_manager
 
         return self._proxy_managers[proxy_url]
